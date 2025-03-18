@@ -9,47 +9,69 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
-// DisableCache will disable caching of the home directory. Caching is enabled
-// by default.
-var DisableCache bool
+const defaultCacheEnabled = true
 
-var homedirCache string
-var cacheLock sync.RWMutex
+// cacheEnabled controls whether caching is enabled.
+// Note that by default, caching is enabled (true value).
+var cacheEnabled atomic.Bool
+
+// homedirCache stores the cached home directory path
+var homedirCache atomic.Value
+
+func init() {
+	homedirCache.Store("")
+	cacheEnabled.Store(defaultCacheEnabled)
+}
+
+// SetCacheEnable enables or disables caching of the home directory.
+// By default, caching is enabled.
+func SetCacheEnable(enable bool) {
+	cacheEnabled.Store(enable)
+}
+
+func CacheEnabled() bool {
+	return cacheEnabled.Load()
+}
 
 // Dir returns the home directory for the executing user.
 //
 // This uses an OS-specific method for discovering the home directory.
 // An error is returned if a home directory cannot be detected.
 func Dir() (string, error) {
-	if !DisableCache {
-		cacheLock.RLock()
-		cached := homedirCache
-		cacheLock.RUnlock()
+	if cacheEnabled.Load() {
+		cached := homedirCache.Load().(string)
 		if cached != "" {
 			return cached, nil
 		}
 	}
 
-	cacheLock.Lock()
-	defer cacheLock.Unlock()
-
-	var result string
-	var err error
-	if runtime.GOOS == "windows" {
-		result, err = dirWindows()
-	} else {
-		// Unix-like system, so just assume Unix
-		result, err = dirUnix()
-	}
-
+	dir, err := detectHomeDir()
 	if err != nil {
 		return "", err
 	}
-	homedirCache = result
-	return result, nil
+
+	if cacheEnabled.Load() {
+		homedirCache.Store(dir)
+	}
+	return dir, nil
+}
+
+// detectHomeDir tries to detect the user's home directory using various methods
+func detectHomeDir() (string, error) {
+	// always check with the standard lib approach first
+	dir, err := os.UserHomeDir()
+	if err == nil && dir != "" {
+		return dir, nil
+	}
+
+	// fall back to OS-specific methods
+	if runtime.GOOS == "windows" {
+		return dirWindows()
+	}
+	return dirUnix(runtime.GOOS)
 }
 
 // Expand expands the path to include the home directory if the path
@@ -81,27 +103,25 @@ func Expand(path string) (string, error) {
 // useful in tests if you're modifying the home directory via the HOME
 // env var or something.
 func Reset() {
-	cacheLock.Lock()
-	defer cacheLock.Unlock()
-	homedirCache = ""
+	homedirCache.Store("")
 }
 
-func dirUnix() (string, error) {
+func dirUnix(goos string) (string, error) {
 	homeEnv := "HOME"
-	if runtime.GOOS == "plan9" {
-		// On plan9, env vars are lowercase.
+	if goos == "plan9" {
+		// on plan9, env vars are lowercase.
 		homeEnv = "home"
 	}
 
-	// First prefer the HOME environmental variable
+	// first prefer the HOME environmental variable
 	if home := os.Getenv(homeEnv); home != "" {
 		return home, nil
 	}
 
 	var stdout bytes.Buffer
 
-	// If that fails, try OS specific commands
-	if runtime.GOOS == "darwin" {
+	// if that fails, try OS specific commands
+	if goos == "darwin" {
 		cmd := exec.Command("sh", "-c", `dscl -q . -read /Users/"$(whoami)" NFSHomeDirectory | sed 's/^[^ ]*: //'`)
 		cmd.Stdout = &stdout
 		if err := cmd.Run(); err == nil {
@@ -111,11 +131,11 @@ func dirUnix() (string, error) {
 			}
 		}
 	} else {
-		cmd := exec.Command("getent", "passwd", strconv.Itoa(os.Getuid()))
+		cmd := exec.Command("getent", "passwd", strconv.Itoa(os.Getuid())) //nolint:gosec
 		cmd.Stdout = &stdout
 		if err := cmd.Run(); err != nil {
-			// If the error is ErrNotFound, we ignore it. Otherwise, return it.
-			if err != exec.ErrNotFound {
+			// if the error is ErrNotFound, we ignore it. Otherwise, return it.
+			if !errors.Is(err, exec.ErrNotFound) {
 				return "", err
 			}
 		} else {
@@ -129,7 +149,7 @@ func dirUnix() (string, error) {
 		}
 	}
 
-	// If all else fails, try the shell
+	// if all else fails, try the shell
 	stdout.Reset()
 	cmd := exec.Command("sh", "-c", "cd && pwd")
 	cmd.Stdout = &stdout
@@ -146,12 +166,12 @@ func dirUnix() (string, error) {
 }
 
 func dirWindows() (string, error) {
-	// First prefer the HOME environmental variable
+	// first prefer the HOME environmental variable
 	if home := os.Getenv("HOME"); home != "" {
 		return home, nil
 	}
 
-	// Prefer standard environment variable USERPROFILE
+	// prefer standard environment variable USERPROFILE
 	if home := os.Getenv("USERPROFILE"); home != "" {
 		return home, nil
 	}
